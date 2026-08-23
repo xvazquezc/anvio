@@ -1758,7 +1758,7 @@ class PangenomeGraph():
         self.version = anvio.__pangraph__version__
         self.functional_annotation_sources_available = DBInfo(self.genomes_storage, expecting='genomestorage').get_functional_annotation_sources() or [] if self.genomes_storage else []
         self.seed = None
-        self.pangenome_graph = PangenomeGraphManager()
+        self.pangenome_graph = PangenomeGraphManager(run=self.run, progress=self.progress)
 
         self.newick = ''
         self.meta = {}
@@ -1814,7 +1814,7 @@ class PangenomeGraph():
     def layout_pangenome_graph(self):
         self.run.warning(None, header="Running maximum force layout algorithm", lc="green")
 
-        node_positions, edge_positions, node_groups = TopologicalLayout().run_synteny_layout_algorithm(
+        node_positions, edge_positions, node_groups = TopologicalLayout(r=self.run, p=self.progress).run_synteny_layout_algorithm(
             F=self.pangenome_graph.graph,
             gene_cluster_grouping_threshold=self.gene_cluster_grouping_threshold,
             groupcompress=self.groupcompress,
