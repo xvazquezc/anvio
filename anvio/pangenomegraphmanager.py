@@ -316,7 +316,7 @@ class PangenomeGraphManager():
         merged_edges = {}
         merged_groups = {}
         for cid in range(n_components):
-            pos, epos, grps = TopologicalLayout().run_synteny_layout_algorithm(
+            pos, epos, grps = TopologicalLayout(r=self.run, p=self.progress).run_synteny_layout_algorithm(
                 F=self.graph,
                 gene_cluster_grouping_threshold=gene_cluster_grouping_threshold,
                 groupcompress=groupcompress,
