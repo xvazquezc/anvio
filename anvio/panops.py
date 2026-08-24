@@ -2106,6 +2106,7 @@ class PangenomeGraph():
             },
             'genome_tracks': {
                 'line_width': track_line_width,
+                'height': tracks_layer,
                 'background_color': '#F5F5F5',
                 'genomes': {
                     genome: {
@@ -2113,7 +2114,7 @@ class PangenomeGraph():
                         'show': True,
                         'track_height': tracks_layer,
                         'track_bg_color': '#F5F5F5',
-                        'track_line_width': 5,
+                        'track_line_width': track_line_width,
                         'show_track': True
                     } for genome in self.genome_names
                 }
