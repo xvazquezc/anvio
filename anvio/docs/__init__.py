@@ -26,7 +26,7 @@ ANVIO_WORKFLOWS = {
     },
 
     "metagenomics": {
-        "authors": ['ShaiberAlon'],
+        "authors": ['FlorianTrigodet', 'ShaiberAlon'],
         "artifacts_produced": ['contigs-db', 'profile-db'],
         "artifacts_accepted": ['samples-txt', 'fasta-txt'],
         "anvio_workflows_inherited": ['contigs'],
@@ -49,7 +49,7 @@ ANVIO_WORKFLOWS = {
             "workflow, you can optionally run annotation programs on your contigs database as well.")
     },
     "ecophylo": {
-        "authors": ['mschecht'],
+        "authors": ['FlorianTrigodet', 'Kekananen', 'mschecht'],
         "artifacts_accepted": ['samples-txt', 'hmm-list', 'external-genomes', 'metagenomes'],
         "artifacts_produced": ['contigs-db', 'profile-db'],
         "anvio_workflows_inherited": [],
@@ -103,7 +103,7 @@ ANVIO_WORKFLOWS = {
     },
 
     "sra-download": {
-        "authors": ['mschecht'],
+        "authors": ['mschecht', 'FlorianTrigodet', 'Kekananen'],
         "artifacts_accepted": [],
         "artifacts_produced": ['paired-end-fastq', 'samples-txt'],
         "anvio_workflows_inherited": [],
@@ -272,6 +272,12 @@ ANVIO_ARTIFACTS ={
     },
     "bam-stats-txt": {
         "name": "BAM STATS TXT",
+        "type": "TXT",
+        "provided_by_anvio": True,
+        "provided_by_user": False
+    },
+    "discov-stats": {
+        "name": "DISCOV STATS",
         "type": "TXT",
         "provided_by_anvio": True,
         "provided_by_user": False
@@ -888,6 +894,12 @@ ANVIO_ARTIFACTS ={
         "provided_by_anvio": True,
         "provided_by_user": False
     },
+    "light-summary": {
+        "name": "LIGHT SUMMARY",
+        "type": "TXT",
+        "provided_by_anvio": True,
+        "provided_by_user": False
+    },
     "split-bins": {
         "name": "SPLIT BINS",
         "type": "CONCEPT",
@@ -1019,6 +1031,24 @@ ANVIO_ARTIFACTS ={
         "type": "TXT",
         "provided_by_anvio": False,
         "provided_by_user":True
+    },
+    "kegg-reaction-txt": {
+        "name": "KEGG REACTION TXT",
+        "type": "TXT",
+        "provided_by_anvio": False,
+        "provided_by_user": True
+    },
+    "kegg-compound-txt": {
+        "name": "KEGG COMPOUND TXT",
+        "type": "TXT",
+        "provided_by_anvio": False,
+        "provided_by_user": True
+    },
+    "kegg-category-colors-txt": {
+        "name": "KEGG CATEGORY COLORS TXT",
+        "type": "TXT",
+        "provided_by_anvio": False,
+        "provided_by_user": True
     },
     "enzymes-list-for-module": {
         "name": "ENZYMES LIST",

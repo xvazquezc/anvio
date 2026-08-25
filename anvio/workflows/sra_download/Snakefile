@@ -5,6 +5,7 @@ import anvio
 import argparse
 import pandas as pd
 import anvio.workflows as w
+import anvio.terminal as terminal
 
 from anvio.errors import ConfigError
 from anvio.workflows.sra_download import SRADownloadWorkflow
@@ -45,6 +46,8 @@ ERR6450082
 """
 
 
+run = terminal.Run()
+
 M = SRADownloadWorkflow(argparse.Namespace(config=config))
 M.init()
 
@@ -56,10 +59,24 @@ def rule_log(rule_name, log_file_name="log"):
     if not log_file_name.endswith(".log"):
         log_file_name = f"{log_file_name}.log"
 
-    return os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
+    log_path = os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
+
+    # Ensure the per-rule log subdirectory exists. This is essential for cluster
+    # submission (e.g. via clusterize), where the submit command opens the log file
+    # at submission time and fails if its parent directory does not already exist.
+    # Doing it here guarantees the directory exists for *every* rule that declares a
+    # log, regardless of whether the rule is registered in `self.rules`.
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+    return log_path
 
 
 remove_tmp = M.get_param_value_from_config(["Remove_unzipped_SRA_files"])
+
+# Constrains the `{accession}` wildcard to the accessions the user actually asked for. Without
+# it snakemake would let `{accession}` match anything at all (including path separators), which
+# makes rules match file names they have no business matching.
+ACCESSION_RE = w.regex_from_ids(M.accessions_list)
 
 
 rule SRA_DOWNLOAD_WORKFLOW_target_rule:
