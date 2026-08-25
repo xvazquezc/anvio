@@ -281,28 +281,6 @@ class Diamond:
         return(output)
 
 
-    def makedb_stdin(self, sequence, output_file_path=None):
-        self.run.warning(None, header="DIAMOND MAKEDB STDIN", lc="green")
-        self.progress.new('DIAMOND')
-        self.progress.update('creating the search database (using %d thread(s)) ...' % self.num_threads)
-
-        cmd_line = ['diamond'
-                    'makedb',
-                    '-d', output_file_path or self.target_fasta,
-                    '-p', self.num_threads]
-
-        utils.run_command_STDIN(cmd_line, self.run.log_file_path,sequence)
-
-        self.progress.end()
-
-        expected_output = utils.run_command_STDIN(cmd_line, self.run.log_file_path,sequence)
-
-        expected_output = get_expected_makedb_output_path(output_file_path or self.target_fasta)
-        self.check_output(expected_output, 'makedb')
-
-        self.run.info('diamond makedb cmd', ' '.join([str(x) for x in cmd_line]), quiet=True)
-
-
     def view(self):
         self.run.warning(None, header="DIAMOND VIEW", lc="green")
         self.progress.new('DIAMOND')
