@@ -34,7 +34,7 @@ Anvi'o includes a means to estimate the number of populations observed in a give
 
 {{ codestart }}
 anvi-gen-function-matrix -e %(external-genomes)s \
-                         --annotation-source COG20_FUNCTION \
+                         --annotation-source %(functions)s \
                          --output-file-prefix MY-METAGENOMES \
                          --add-per-population-copy-number
 {{ codestop }}
@@ -51,7 +51,7 @@ Alternatively, you can run it with a %(groups-txt)s that associates sets of geno
 
 {{ codestart }}
 anvi-gen-function-matrix -i %(internal-genomes)s \
-                         --annotation-source COG20_FUNCTION \
+                         --annotation-source %(functions)s \
                          --output-file-prefix MY-GENOMES \
                          --groups-txt groups.txt
 {{ codestop }}
