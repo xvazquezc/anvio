@@ -2282,13 +2282,23 @@ class PangenomeGraph():
         self.progress.update('...')
 
         table_for_distances = TableForGenomeDistances(self.pan_graph_db_path, run=self.run, progress=self.progress)
-        for genome_a in self.distance_matrix.index:
-            for genome_b in self.distance_matrix.columns:
+
+        # iterating over the underlying numpy array rather than asking pandas for
+        # `.loc[genome_a, genome_b]` per cell is over 10x faster for large genome
+        # sets  (pandas posion everything for a negligible convenience and Meren
+        # believes that we should get rid of pandas entirely from anvi'o, but
+        # that is a separate discussion):
+        genome_names_a = list(self.distance_matrix.index)
+        genome_names_b = list(self.distance_matrix.columns)
+        distances = self.distance_matrix.to_numpy()
+
+        for i, genome_a in enumerate(genome_names_a):
+            for j, genome_b in enumerate(genome_names_b):
                 if genome_a == genome_b:
                     continue
                 table_for_distances.add({'genome_a': genome_a,
                                          'genome_b': genome_b,
-                                         'distance': float(self.distance_matrix.loc[genome_a, genome_b])})
+                                         'distance': float(distances[i, j])})
 
         self.progress.end()
 
