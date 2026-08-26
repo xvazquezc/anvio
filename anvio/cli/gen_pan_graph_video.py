@@ -140,6 +140,20 @@ INSET_CORNER_RADIUS = 24
 # inside the left text column
 PANEL_TOP, PANEL_BOTTOM = 980, 2080
 
+# the rarefaction panel's own type sizes and paddings, in 2160-tall-frame units. It is a
+# small chart in a big panel, so these are set against the panel rather than the canvas
+RAREFACTION_PAD = 54              # panel edge to anything drawn inside it
+RAREFACTION_TICK_SIZE = 38        # tick labels on both axes
+RAREFACTION_LABEL_SIZE = 42       # the two axis titles, and the legend
+RAREFACTION_FIT_SIZE = 40         # the Heaps' Law annotation
+RAREFACTION_RIBBON_OPACITY = 0.16 # the +/- one standard deviation band around each curve
+RAREFACTION_TICK_LEN = 12         # how far a tick mark sticks out of the axis
+RAREFACTION_GRID = (238, 238, 238)  # horizontal gridlines, lighter than FAINT reads at this size
+
+# default colors of the two rarefaction curves: every SynGC, and the core ones
+RAREFACTION_ALL_SYNGCS_COLOR = '#1F6FEB'
+RAREFACTION_CORE_SYNGCS_COLOR = '#D1242F'
+
 # how many pixels of arc each sampled point along a constant-radius segment covers. Small
 # enough that a long sweep around a ring reads as a smooth curve rather than a polygon
 ARC_SAMPLE_PX = 4
@@ -186,6 +200,13 @@ class PanGraphVideoGenerator:
         self.genomes_of_interest_arg = A('genomes_of_interest')
         self.exclude_genomes_arg = A('exclude_genomes')
         self.max_num_genomes_to_render = A('max_num_genomes_to_render')
+
+        self.show_rarefaction = A('show_rarefaction') or False
+        self.rarefaction_iterations = A('rarefaction_iterations') if A('rarefaction_iterations') is not None else 100
+        self.rarefaction_all_syngcs_color = A('rarefaction_all_syngcs_color') or RAREFACTION_ALL_SYNGCS_COLOR
+        self.rarefaction_core_syngcs_color = A('rarefaction_core_syngcs_color') or RAREFACTION_CORE_SYNGCS_COLOR
+        self.rarefaction_line_width = A('rarefaction_line_width')
+        self.rarefaction_fade_in_at_genome = A('rarefaction_fade_in_at_genome')
 
         self.inset_flanks_arg = A('inset_flanks')
         self.inset_nodes_cover_window_dynamically = A('inset_graph_nodes_cover_window_dynamically') or False
@@ -263,6 +284,7 @@ class PanGraphVideoGenerator:
         self.type_colors = {}
         self.total_genomes_rendered = None
         self.new_nodes_per_frame = []    # per frame, the nodes that were new to the graph in it
+        self.rarefaction = None          # the curves --show-rarefaction draws; see `compute_rarefaction`
 
         # thread-local rather than one shared dict, see `get_font`
         self._fonts = threading.local()
@@ -292,6 +314,13 @@ class PanGraphVideoGenerator:
     def sanity_check(self):
         filesnpaths.is_file_exists(self.pan_graph_db_path)
         utils.is_pan_graph_db(self.pan_graph_db_path)
+
+        if os.path.splitext(self.output_file)[1].lower() != '.mp4':
+            raise ConfigError(f"The output file name has to end with '.mp4', and '{self.output_file}' does not. "
+                              f"This program only makes MP4s, and the extension is how `ffmpeg` is told which "
+                              f"container to write, so anvi'o would rather mention it now than after spending "
+                              f"a while rendering every single frame of your video :)")
+
         filesnpaths.is_output_file_writable(self.output_file, ok_if_exists=False)
 
         if self.dry_run and not self.export_stills:
@@ -321,6 +350,30 @@ class PanGraphVideoGenerator:
                               f"is still on its way there. Please pick one of the two. Note that "
                               f"--inset-graph-new-node-effect is untouched by this, since nothing in the inset "
                               f"panel flies.")
+
+        if self.show_rarefaction and self.inset_flanks_arg:
+            raise ConfigError("--show-rarefaction and --inset-flanks both want the one panel in the left-hand "
+                              "column, so you can have either the magnified locus or the rarefaction curves, "
+                              "but not both at once. Please drop one of the two.")
+
+        if self.rarefaction_iterations < 1:
+            raise ConfigError(f"--rarefaction-iterations is how many times each genome count is subsampled to "
+                              f"build the curves, so it has to be at least 1 (and really it should be at least "
+                              f"10). It is {self.rarefaction_iterations} :/")
+
+        if self.rarefaction_line_width is not None and self.rarefaction_line_width <= 0:
+            raise ConfigError("--rarefaction-line-width is a line width in pixels, so it has to be greater "
+                              "than zero.")
+
+        if self.rarefaction_fade_in_at_genome is not None and self.rarefaction_fade_in_at_genome < 1:
+            raise ConfigError(f"--rarefaction-fade-in-at-genome names the genome the rarefaction panel should "
+                              f"arrive with, and genomes are counted from 1, so it cannot be "
+                              f"{self.rarefaction_fade_in_at_genome} :/")
+
+        if self.rarefaction_fade_in_at_genome is not None and not self.show_rarefaction:
+            raise ConfigError("--rarefaction-fade-in-at-genome says when the rarefaction panel should come "
+                              "in, but --show-rarefaction was not passed, so there is no rarefaction panel "
+                              "for it to bring in :/")
 
         if self.inset_graph_level_height is not None and self.inset_graph_level_height <= 0:
             raise ConfigError("--inset-graph-level-height is a height in pixels, so it has to be greater "
@@ -517,6 +570,9 @@ class PanGraphVideoGenerator:
         if self.inset_flank_ids:
             self.validate_inset_flanks()
 
+        if self.show_rarefaction:
+            self.compute_rarefaction()
+
 
     def validate_inset_flanks(self):
         left, right = self.inset_flank_ids
@@ -532,6 +588,73 @@ class PanGraphVideoGenerator:
                                   f"your pan-graph-db in `anvi-display-pan-graph`.")
 
 
+    def compute_rarefaction(self):
+        """Rarefaction curves for the genomes this video renders over the whole pan-graph-db.
+
+        Please note: this does not care about your components. If you need it to, then we will
+        have to work on it more.
+
+        The GENOMES, on the other hand, are exactly the ones being rendered, in the order they
+        arrive."""
+
+        from anvio.panops import RarefactionAnalysis
+
+        # one genome arrives per frame, and `frame['genomes'][-1]` is the one that arrived
+        genomes = [frame['genomes'][-1] for frame in self.frames]
+
+        if len(genomes) < 3:
+            raise ConfigError(f"--show-rarefaction needs at least three genomes to draw a curve through, and "
+                              f"this video renders {P('genome', len(genomes))}. Either render more genomes, or "
+                              f"drop --show-rarefaction.")
+
+        self.run.warning(None, header="COMPUTING RAREFACTION CURVES", lc="green")
+        self.run.info("Genomes", f"{len(genomes)} (the ones being rendered, in arrival order)")
+        self.run.info("SynGCs considered", "every SynGC in the pan-graph-db, not just the drawn component")
+        self.run.info("Iterations per genome count", self.rarefaction_iterations)
+
+        rarefaction_args = argparse.Namespace(pan_or_pan_graph_db=self.pan_graph_db_path,
+                                              genome_names=genomes,
+                                              iterations=self.rarefaction_iterations,
+                                              skip_output_files=True)
+
+        # a quiet Run, since this program reports these numbers itself, in its own sections
+        analysis = RarefactionAnalysis(rarefaction_args, run=terminal.Run(verbose=False), progress=self.progress)
+
+        self.progress.new("Calculating rarefaction curves", progress_total_items=len(genomes))
+        self.progress.update('...')
+        pangenome_counts, core_counts = analysis.calc_rarefaction_curves()
+        self.progress.end()
+
+        pangenome, _ = analysis.summarize_counts(pangenome_counts)
+        core, _ = analysis.summarize_counts(core_counts)
+        k, alpha = analysis.fit_heaps_law(pangenome)
+
+        # out of numpy and pandas and into plain floats here, at the boundary: everything
+        # downstream of this is drawing code, and it has no business knowing about either
+        L = lambda column, table: [float(v) for v in table[column].values]
+
+        self.rarefaction = {'num_syngcs': analysis.num_items,
+                            'pangenome_mean': L('avg_num_gene_clusters', pangenome),
+                            'pangenome_sd': L('standard_deviation', pangenome),
+                            'core_mean': L('avg_num_gene_clusters', core),
+                            'core_sd': L('standard_deviation', core),
+                            'k': float(k),
+                            'alpha': float(alpha)}
+
+        if self.rarefaction_fade_in_at_genome is not None and self.rarefaction_fade_in_at_genome > len(genomes):
+            raise ConfigError(f"--rarefaction-fade-in-at-genome is {self.rarefaction_fade_in_at_genome}, but "
+                              f"this video only renders {P('genome', len(genomes))}, so the rarefaction panel "
+                              f"would be waiting for a genome that never arrives and would never be seen at "
+                              f"all. Please pick a number no greater than {len(genomes)}.")
+
+        self.run.info("SynGCs found", pp(analysis.num_items))
+        self.run.info("Core SynGCs (in every rendered genome)", pp(int(round(self.rarefaction['core_mean'][-1]))))
+        self.run.info("Heaps' Law parameters estimated", f"K={k:.4f}, alpha={alpha:.4f}", mc="green")
+
+        if self.inset_description is None:
+            self.inset_description = f"Rarefaction of {pp(analysis.num_items)} SynGCs"
+
+
     def compute_geometry(self):
         """Pin one set of scale constants derived from the LAST (largest) frame, and reuse
         them for every frame. That is what makes the growth read as the graph expanding
@@ -544,7 +667,10 @@ class PanGraphVideoGenerator:
         final_nodes = self.frames[-1]['data']['nodes']
         final_x_max = max(d['position'][0] for d in final_nodes.values())
 
+        # the two things that can claim the panel. `sanity_check` has already ruled out both
+        # being asked for at once, so at most one of these is ever true
         has_inset = self.inset_flank_ids is not None
+        has_rarefaction = self.show_rarefaction
 
         # The whole right-side panel (tracks + graph together) always fills as much of the
         # canvas as it can, and is NOT what shrinks as genomes accumulate. Only the graph's
@@ -623,6 +749,7 @@ class PanGraphVideoGenerator:
 
         self.geom = {
             'has_inset': has_inset,
+            'has_rarefaction': has_rarefaction,
             'col_x': col_x, 'col_w': col_w,
             'panel_box': self.inset_panel_box(col_x, col_w),
             'disty_px': disty_px,
@@ -666,17 +793,20 @@ class PanGraphVideoGenerator:
 
         if has_inset:
             self.compute_inset_geometry()
+        elif has_rarefaction:
+            self.compute_rarefaction_geometry()
 
         self.compute_counter_block_layout()
 
 
     def inset_panel_box(self, col_x, col_w):
-        """Where the inset panel sits: as tall as --inset-aspect makes it, centered in the band
-        of the column reserved for it.
+        """Where the panel sits: as tall as --inset-aspect makes it, centered in the band of the
+        column reserved for it. The magnified locus (--inset-flanks) and the rarefaction curves
+        (--show-rarefaction) both draw into this same box.
 
         This depends on nothing but the column and that aspect, so it can be worked out whether
-        or not there is actually an inset to draw. That is what lets the counter block above it
-        stack against the same edge either way."""
+        or not there is actually anything to draw in it. That is what lets the counter block
+        above it stack against the same edge either way."""
 
         panel_h = int(round(col_w / self.inset_aspect))
         band_top, band_bottom = self.px(PANEL_TOP), self.px(PANEL_BOTTOM)
@@ -1107,13 +1237,18 @@ class PanGraphVideoGenerator:
         return shapes
 
 
-    def build_scene(self, frame_idx, name_the_genome_added=True, arrivals_in_flight=False):
+    def build_scene(self, frame_idx, name_the_genome_added=True, arrivals_in_flight=False,
+                    panel_opacity=1.0):
         """This frame's whole picture, as shapes and text.
 
         `arrivals_in_flight` leaves this frame's own new NODES out, which is what the arrival
         overlay wants: while they are still on their way in they must not also be sitting at their
         destinations underneath it. The frame is otherwise identical, so the held part of a
-        genome's turn and the flight share everything but those few nodes."""
+        genome's turn and the flight share everything but those few nodes.
+
+        `panel_opacity` fades the rarefaction panel and its description line up together, and is
+        how `--rarefaction-fade-in-at-genome` brings them in (see `rarefaction_fade_frames`).
+        Nothing else in the frame is touched by it."""
 
         frame = self.frames[frame_idx]
         nodes = frame['data']['nodes']
@@ -1153,9 +1288,12 @@ class PanGraphVideoGenerator:
 
         if self.geom.get('has_inset'):
             self.add_inset_shapes(shapes, frame_idx)
+        elif self.geom.get('has_rarefaction') and self.rarefaction_panel_visible(frame['n']):
+            self.add_rarefaction_shapes(shapes, texts, frame_idx, opacity=panel_opacity)
 
         self.add_text_ops(texts, shapes, frame['n'], self.total_genomes_rendered,
-                          frame['genomes'][-1] if name_the_genome_added else None)
+                          frame['genomes'][-1] if name_the_genome_added else None,
+                          panel_opacity=panel_opacity)
 
         return {'shapes': shapes, 'texts': texts}
 
@@ -1416,6 +1554,337 @@ class PanGraphVideoGenerator:
                           inset['node_edge_color'], inset['node_edge_width']))
 
 
+    @staticmethod
+    def nice_axis_range(min_value, max_value, target_count=5):
+        """An axis that spans `min_value` to `max_value` on a 1/2/5 x 10^k step. Returns
+        `(ticks, axis_min, axis_max)`.
+
+        This axis deliberately does NOT start at zero becasue it looks ugly :/ Instead, we find
+        a round number below the minimum and above the maximum for a nice range. It really is
+        a lot of code for something so tiny, but these are the kinds of details that make
+        visualization or break it."""
+
+        span = max_value - min_value
+
+        # curves with no span at all (every SynGC in every genome, and so no spread to draw
+        # either) leave nothing to size a step from, so it comes off the value itself instead
+        if span <= 0:
+            span = abs(max_value) or 1.0
+
+        raw_step = span / max(1, target_count)
+        magnitude = 10.0 ** math.floor(math.log10(raw_step))
+
+        step = magnitude
+        for multiple in (1, 2, 5, 10):
+            step = multiple * magnitude
+            if raw_step <= step:
+                break
+
+        axis_min = max(0.0, math.floor(min_value / step) * step)
+        axis_max = math.ceil(max_value / step) * step
+
+        # a single-valued curve sits exactly on a tick, and would otherwise round to no span at all
+        if axis_max <= axis_min:
+            axis_max = axis_min + step
+
+
+        # counted out rather than accumulated, so that a tick label is never 2999.9999999
+        num_steps = int(round((axis_max - axis_min) / step))
+
+        return [axis_min + i * step for i in range(num_steps + 1)], axis_min, axis_max
+
+
+    @staticmethod
+    def genome_axis_ticks(num_genomes, target_count=5):
+        """Integer genome-count ticks."""
+
+        if num_genomes <= target_count:
+            return list(range(1, num_genomes + 1))
+
+        raw_step = num_genomes / target_count
+        magnitude = 10.0 ** math.floor(math.log10(raw_step))
+
+        step = magnitude
+        for multiple in (1, 2, 5, 10):
+            step = multiple * magnitude
+            if raw_step <= step:
+                break
+
+        step = max(1, int(round(step)))
+        interior = [t for t in range(step, num_genomes, step)
+                    if t - 1 >= step * 0.5 and num_genomes - t >= step * 0.5]
+
+        return [1] + interior + [num_genomes]
+
+
+    def compute_rarefaction_geometry(self):
+        """Pins the rarefaction panel's scales, boxes and type metrics once, from the FULL curves.
+
+        The same principle as `compute_inset_geometry`: the axes do not move as the video runs.
+        A chart whose y axis rescaled itself every time the curve grew would read as the axis
+        shrinking rather than as the pangenome growing, and that second reading is the entire
+        point of the panel. So both scales are solved from the finished curves here, and every
+        frame then draws the very same axes with more of the curve on them.
+
+        The panel's interior is divided into fixed bands -- a label/legend row, the plot, the x
+        tick labels, a footer row -- rather than letting any text float over the plot area. Text
+        placed in the empty corner of one dataset's chart lands squarely on another's curve, and
+        this program cannot look at the chart it is drawing."""
+
+        ox, oy, panel_w, panel_h = self.geom['panel_box']
+        r = self.rarefaction
+
+        pad, gap = self.px(RAREFACTION_PAD), self.px(20)
+        tick_len = self.px(RAREFACTION_TICK_LEN)
+
+        tick_size = self.px(RAREFACTION_TICK_SIZE)
+        label_size = self.px(RAREFACTION_LABEL_SIZE)
+        fit_size = self.px(RAREFACTION_FIT_SIZE)
+
+        tick_font = self.get_font(tick_size, 'regular')
+        label_font = self.get_font(label_size, 'medium')
+        fit_font = self.get_font(fit_size, 'regular')
+
+        # a text row is as tall as the FACE, ascender to descender, whatever happens to be
+        # written on it, so that a row carrying no descender is not a different height
+        row_h = lambda font: sum(font.getmetrics())
+
+        num_genomes = len(r['pangenome_mean'])
+
+        # the y axis has to hold everything that will ever be drawn against it, and what is
+        # drawn is the RIBBONS rather than the means they are drawn around -- so both ends come
+        # from the ribbon edges, of both curves, not from the means of the taller one
+        ribbon_edges = [mean + sign * sd
+                        for curve in ('pangenome', 'core')
+                        for mean, sd in zip(r[curve + '_mean'], r[curve + '_sd'])
+                        for sign in (-1, 1)]
+        y_ticks, y_min, y_max = self.nice_axis_range(min(ribbon_edges), max(ribbon_edges))
+        x_ticks = self.genome_axis_ticks(num_genomes)
+
+        y_tick_labels = {tick: pp(int(round(tick))) for tick in y_ticks}
+        x_tick_labels = {tick: str(tick) for tick in x_ticks}
+
+        # the y tick labels sit in a gutter as wide as the widest of them
+        gutter = max(tick_font.getlength(label) for label in y_tick_labels.values()) + tick_len + self.px(14)
+
+        top_row_h = max(row_h(label_font), row_h(tick_font))
+        footer_h = max(row_h(label_font), row_h(fit_font))
+
+        plot_x0, plot_x1 = ox + pad + gutter, ox + panel_w - pad
+        plot_y0 = oy + pad + top_row_h + gap
+        plot_y1 = oy + panel_h - pad - footer_h - gap - row_h(tick_font) - gap
+
+        if plot_x1 - plot_x0 < self.px(200) or plot_y1 - plot_y0 < self.px(150):
+            self.run.warning("There is very little room left for the rarefaction curves once their axis "
+                             "labels and legend have been placed, so the panel may look cramped. A larger "
+                             "--resolution, or a smaller --inset-aspect, would give it more room.")
+
+        # the legend, laid out right-to-left from the plot area's right edge so that it finishes
+        # flush with the axis rather than with the panel
+        swatch_r = self.px(13)
+        legend_gap, legend_entry_gap = self.px(14), self.px(46)
+        entries = [('All SynGCs', self.hex_to_rgb(self.rarefaction_all_syngcs_color)),
+                   ('Core SynGCs', self.hex_to_rgb(self.rarefaction_core_syngcs_color))]
+
+        legend_w = (sum(2 * swatch_r + legend_gap + label_font.getlength(label) for label, _ in entries)
+                    + legend_entry_gap * (len(entries) - 1))
+
+        legend, x = [], plot_x1 - legend_w
+        for label, color in entries:
+            legend.append({'label': label, 'color': color, 'swatch_x': x + swatch_r,
+                           'text_x': x + 2 * swatch_r + legend_gap})
+            x += 2 * swatch_r + legend_gap + label_font.getlength(label) + legend_entry_gap
+
+        line_w = self.rarefaction_line_width if self.rarefaction_line_width is not None else max(1.5, self.px(7))
+
+        # PIL anchors text at the ascender rather than at the baseline, so anything that has to
+        # line up with something else needs its own nudge, and every one of these is measured off
+        # real ink or real face metrics rather than off the type size. `y_tick_dy` centers a tick
+        # label's digits on the tick itself; the two footer nudges put a label and the fit on one
+        # shared baseline even though they are set at different sizes.
+        digit_box = tick_font.getbbox('0')
+        footer_ascent = max(label_font.getmetrics()[0], fit_font.getmetrics()[0])
+
+        self.geom['rarefaction'] = {
+            'plot_x0': plot_x0, 'plot_x1': plot_x1, 'plot_y0': plot_y0, 'plot_y1': plot_y1,
+            'x_scale': (plot_x1 - plot_x0) / max(1, num_genomes - 1),
+            'y_scale': (plot_y1 - plot_y0) / (y_max - y_min),
+            'y_min': y_min, 'y_max': y_max,
+            'y_ticks': y_ticks, 'x_ticks': x_ticks,
+            'y_tick_labels': y_tick_labels, 'x_tick_labels': x_tick_labels,
+            'tick_len': tick_len, 'gutter_gap': self.px(14),
+            'tick_size': tick_size, 'label_size': label_size, 'fit_size': fit_size,
+            'y_tick_dy': -(digit_box[1] + digit_box[3]) / 2.0,
+            'x_tick_y': plot_y1 + tick_len + self.px(10),
+            'label_y': oy + pad,
+            'legend_dy': (top_row_h - row_h(label_font)) / 2.0,
+            'legend_swatch_y': oy + pad + (top_row_h - row_h(label_font)) / 2.0 + row_h(label_font) / 2.0,
+            'footer_label_y': oy + panel_h - pad - footer_h + footer_ascent - label_font.getmetrics()[0],
+            'footer_fit_y': oy + panel_h - pad - footer_h + footer_ascent - fit_font.getmetrics()[0],
+            'axis_label_x': ox + pad,
+            'legend': legend, 'swatch_r': swatch_r,
+            'line_w': line_w,
+            'dot_r': line_w * 1.7,
+            'axis_w': max(1.0, self.px(3)),
+            'all_syngcs_color': self.hex_to_rgb(self.rarefaction_all_syngcs_color),
+            'core_syngcs_color': self.hex_to_rgb(self.rarefaction_core_syngcs_color),
+        }
+
+
+    def rarefaction_panel_visible(self, genome_count):
+        """Whether the rarefaction panel, and the description line above it, are drawn at this
+        genome count. Everything else in the column is unaffected either way.
+
+        `--rarefaction-fade-in-at-genome` names the genome the panel arrives WITH, and this holds
+        it back until then. It answers whether the panel is drawn AT ALL for a genome count; how
+        strongly it is drawn on the way in is `rarefaction_fade_frames` and the `panel_opacity`
+        that `build_scene` threads down from it.
+
+        The panel's LAYOUT does not depend on either, since the slot it occupies is reserved
+        whether or not anything is drawn in it (see `inset_panel_box` and
+        `compute_counter_block_layout`), so nothing above it moves when it appears."""
+
+        if not self.geom.get('has_rarefaction') or self.rarefaction_fade_in_at_genome is None:
+            return True
+
+        return genome_count >= self.rarefaction_fade_in_at_genome
+
+
+    def rarefaction_fade_frames(self):
+        """How many frames the rarefaction panel takes to fade in, and 0 when it does not fade.
+
+        --seconds-per-genome, deliberately, rather than the --dissolve-seconds the panel used to
+        ride in on: a dissolve is a fifth of a second at its default, which reads as the panel
+        snapping into place rather than arriving. A fade as long as a genome's own turn on screen
+        is slow enough to watch.
+
+        It still lands where `--rarefaction-fade-in-at-genome` says, because it STARTS the moment
+        that genome does: the panel is at nothing on the first frame of that genome's turn and at
+        full strength by the end of it. The fade fits inside the one turn and so costs the video
+        no extra frames -- it only moves frames of that turn from being repeats of one still to
+        being rasterized one at a time (see `count_hard_linked_frames`)."""
+
+        if not self.geom.get('has_rarefaction') or self.rarefaction_fade_in_at_genome is None:
+            return 0
+
+        # nothing precedes genome 1, so there is nothing for the panel to fade up out of: it is
+        # simply there, exactly as it is when the flag is not used at all
+        if self.rarefaction_fade_in_at_genome <= 1:
+            return 0
+
+        return max(1, int(round(self.seconds_per_genome * self.fps)))
+
+
+    def add_rarefaction_shapes(self, shapes, texts, frame_idx, opacity=1.0):
+        """The rarefaction panel: fixed axes, with both curves revealed up to this frame.
+
+        `opacity` fades the whole panel up as one, which is what
+        `--rarefaction-fade-in-at-genome` uses to bring it in over a genome's turn (see
+        `rarefaction_fade_frames`). It multiplies through every piece of ink here, and the two
+        kinds that have no opacity of their own -- the panel's outline, and every line of text --
+        go through `fade_color` instead.
+
+        The reveal is the whole trick. Axes, gridlines, ticks, legend and the Heaps' Law fit are
+        identical in every single frame -- they were all solved once, in
+        `compute_rarefaction_geometry` -- and the only thing that changes is how much of each
+        curve has been drawn: exactly `frame_idx + 1` genomes' worth, which is the very number
+        the counter above the panel is showing."""
+
+        g = self.geom['rarefaction']
+        ox, oy, panel_w, panel_h = self.geom['panel_box']
+        n_shown = frame_idx + 1
+
+        def project(n, value):
+            return (g['plot_x0'] + (n - 1) * g['x_scale'],
+                    g['plot_y1'] - (value - g['y_min']) * g['y_scale'])
+
+        def text(tx, ty, size, role, color, s):
+            texts.append(('text', tx, ty, size, role, self.fade_color(color, opacity), s))
+
+        def dot(x, y, radius, color):
+            # outline in the fill's own color, so the two renderers agree on the footprint. A
+            # `fading_circle` at full opacity draws exactly what a `circle` does, so this is one
+            # primitive rather than two.
+            shapes.append(('fading_circle', x, y, radius, color, color, 0.0, opacity))
+
+        # the panel's chrome, the same as the magnified inset's, so the two read as siblings
+        shapes.append(('round_rect', ox, oy, panel_w, panel_h, self.px(INSET_CORNER_RADIUS),
+                      self.tint_color(), opacity))
+        shapes.append(('round_rect_outline', ox, oy, panel_w, panel_h, self.px(INSET_CORNER_RADIUS),
+                      self.fade_color(BLUE, opacity), self.border_width_px()))
+
+        # gridlines first, so that everything else lands on top of them
+        for tick in g['y_ticks']:
+            _, ty = project(1, tick)
+            shapes.append(('polyline', [(g['plot_x0'], ty), (g['plot_x1'], ty)],
+                          RAREFACTION_GRID, g['axis_w'], opacity))
+
+        # the two axes, as one path down the left and along the bottom
+        shapes.append(('polyline', [(g['plot_x0'], g['plot_y0']), (g['plot_x0'], g['plot_y1']),
+                                   (g['plot_x1'], g['plot_y1'])], MUTED, g['axis_w'], opacity))
+
+        for tick in g['x_ticks']:
+            tx, _ = project(tick, 0)
+            shapes.append(('polyline', [(tx, g['plot_y1']), (tx, g['plot_y1'] + g['tick_len'])],
+                          MUTED, g['axis_w'], opacity))
+
+        for tick in g['y_ticks']:
+            _, ty = project(1, tick)
+            shapes.append(('polyline', [(g['plot_x0'] - g['tick_len'], ty), (g['plot_x0'], ty)],
+                          MUTED, g['axis_w'], opacity))
+
+        curves = [(self.rarefaction['pangenome_mean'], self.rarefaction['pangenome_sd'], g['all_syngcs_color']),
+                  (self.rarefaction['core_mean'], self.rarefaction['core_sd'], g['core_syngcs_color'])]
+
+        # every ribbon before any line, so that neither ribbon washes over the other's line
+        # where the two curves run close together
+        if n_shown >= 2:
+            for means, sds, color in curves:
+                upper = [project(n + 1, min(g['y_max'], means[n] + sds[n])) for n in range(n_shown)]
+                lower = [project(n + 1, max(g['y_min'], means[n] - sds[n])) for n in range(n_shown)]
+                shapes.append(('polygon', upper + lower[::-1], color, RAREFACTION_RIBBON_OPACITY * opacity))
+
+        for means, _sds, color in reversed(curves):
+            points = [project(n + 1, means[n]) for n in range(n_shown)]
+            if len(points) >= 2:
+                shapes.append(('polyline', points, color, g['line_w'], opacity))
+            # the leading edge, marking where this curve has got to in this frame
+            dot(points[-1][0], points[-1][1], g['dot_r'], color)
+
+        tick_font = self.get_font(g['tick_size'], 'regular')
+
+        for tick in g['y_ticks']:
+            label = g['y_tick_labels'][tick]
+            _, ty = project(1, tick)
+            text(g['plot_x0'] - g['tick_len'] - g['gutter_gap'] - tick_font.getlength(label),
+                 ty + g['y_tick_dy'], g['tick_size'], 'regular', MUTED, label)
+
+        for tick in g['x_ticks']:
+            label = g['x_tick_labels'][tick]
+            tx, _ = project(tick, 0)
+            text(tx - tick_font.getlength(label) / 2.0, g['x_tick_y'], g['tick_size'], 'regular', MUTED, label)
+
+        # the top row: what the y axis counts, and the legend
+        text(g['axis_label_x'], g['label_y'], g['label_size'], 'medium', INK, 'SynGCs')
+
+        for entry in g['legend']:
+            dot(entry['swatch_x'], g['legend_swatch_y'], g['swatch_r'], entry['color'])
+            text(entry['text_x'], g['label_y'] + g['legend_dy'], g['label_size'], 'medium', MUTED, entry['label'])
+
+        # the footer row: what the x axis counts, and the fit over the WHOLE curve (a fit to the
+        # revealed part alone would be meaningless for the first few frames, and would read as
+        # the number wobbling rather than as the curve arriving)
+        text(g['plot_x0'], g['footer_label_y'], g['label_size'], 'medium', INK, 'Genomes')
+
+        # The fit describes the FINISHED curve, so it waits for the finished curve: parking a
+        # final K and alpha next to a curve three points long would read as a claim about those
+        # three points. Its slot in the footer is reserved from the first frame either way (see
+        # `compute_rarefaction_geometry`), so it appears without moving anything.
+        if n_shown == len(self.rarefaction['pangenome_mean']):
+            fit = f"Heaps' Law: K={self.rarefaction['k']:.1f}, \u03b1={self.rarefaction['alpha']:.3f}"
+            fit_w = self.get_font(g['fit_size'], 'regular').getlength(fit)
+            text(g['plot_x1'] - fit_w, g['footer_fit_y'], g['fit_size'], 'regular', MUTED, fit)
+
     def add_inset_marker_shapes(self, shapes, frame_idx, x_max, n_genomes):
         """The counterpart of the inset panel on the main graph: a wedge over exactly the
         stretch of graph the panel magnifies, in the panel's own fill and outline, so the eye
@@ -1627,7 +2096,7 @@ class PanGraphVideoGenerator:
         return head
 
 
-    def add_text_ops(self, texts, shapes, label, ngen, genome_added):
+    def add_text_ops(self, texts, shapes, label, ngen, genome_added, panel_opacity=1.0):
         """The genome counter block (see `counter_block_geometry`), plus an optional three-part
         title above it and the inset description below it. Every one of these sits in the same
         place whether or not there is an inset; without one, the description is the only piece
@@ -1666,10 +2135,27 @@ class PanGraphVideoGenerator:
 
         # --inset-description lives in the slot between the progress bar and the inset panel,
         # in the same style as --subtitle. That slot is reserved either way, so this drawing
-        # nothing is what the no-inset case looks like.
-        for i, line in enumerate(layout['description_lines']):
+        # nothing is what the no-inset case looks like -- and also what a rarefaction panel that
+        # has not faded in yet looks like, since the line describes the panel.
+        for i, line in enumerate(layout['description_lines'] if self.rarefaction_panel_visible(label) else []):
             text(x, layout['description_y'] + i * c['description_line_height'],
-                 c['description_size'], 'regular', MUTED, line)
+                 c['description_size'], 'regular', self.fade_color(MUTED, panel_opacity), line)
+
+
+    def fade_color(self, color, opacity):
+        """`color` blended toward the canvas background.
+
+        For the renderers' primitives that carry no opacity of their own -- an outline width, a
+        line of text -- and it is not an approximation of compositing: the background is one
+        known solid color, so blending against it lands on exactly the pixel that compositing at
+        that alpha would have produced, for nothing."""
+
+        if opacity >= 1.0:
+            return color
+
+        background = self.hex_to_rgb(self.background_color)
+
+        return tuple(int(round(b + (c - b) * max(0.0, opacity))) for c, b in zip(color, background))
 
 
     @staticmethod
@@ -1748,6 +2234,12 @@ class PanGraphVideoGenerator:
         linked = max(1, int(self.hold_first_seconds * self.fps)) - 1
         linked += (len(self.frames) - 1) * (max(1, turn_frames - arrival_frames) - 1)
         linked += max(1, int(self.hold_last_seconds * self.fps)) - 1
+
+        # the one genome the rarefaction panel fades in on renders more of its own turn a frame
+        # at a time than the others do, and so repeats correspondingly less of it
+        fade_frames = self.rarefaction_fade_frames()
+        if fade_frames > arrival_frames:
+            linked -= (max(1, turn_frames - arrival_frames) - max(1, turn_frames - fade_frames))
 
         return linked
 
@@ -1947,7 +2439,7 @@ class PanGraphVideoGenerator:
 
     def export_still(self, scene, key):
         svg_path, png_path = self.still_paths[key]
-        with open(svg_path, 'w') as f:
+        with open(svg_path, 'w', encoding='utf-8') as f:
             f.write(self.scene_to_svg(scene))
         self.rasterize_scene(scene).save(png_path)
         self.run.info(f"Still frame ({key})", f"{svg_path}, {png_path}")
@@ -2007,6 +2499,16 @@ class PanGraphVideoGenerator:
             show("Inset graph edge color", "inset-graph-edge-color", self.inset_graph_edge_color)
             show("Inset graph edge opacity", "inset-graph-edge-opacity", inset['edge_opacity'])
 
+        if g.get('has_rarefaction'):
+            rarefaction = g['rarefaction']
+            show("Rarefaction all-SynGCs color", "rarefaction-all-syngcs-color", self.rarefaction_all_syngcs_color)
+            show("Rarefaction core-SynGCs color", "rarefaction-core-syngcs-color", self.rarefaction_core_syngcs_color)
+            show("Rarefaction line width", "rarefaction-line-width", rarefaction['line_w'])
+            show("Rarefaction iterations", "rarefaction-iterations", str(self.rarefaction_iterations))
+            show("Rarefaction fade-in at genome", "rarefaction-fade-in-at-genome",
+                 str(self.rarefaction_fade_in_at_genome) if self.rarefaction_fade_in_at_genome is not None
+                 else "not set (the panel is there from the first genome)")
+
         if self.show_genome_tracks:
             show("Genome track line width", "genome-track-line-width", g['genome_track_line_width'])
             show("Genome track line color", "genome-track-line-color", self.genome_track_line_color or "auto (per genome, from pan-graph-db)")
@@ -2059,6 +2561,12 @@ class PanGraphVideoGenerator:
         if effect_frames:
             to_rasterize += self.genome_turn_frames(effect_frames)[1] * (len(scenes) - 1)
 
+        # the fading genome's turn is rendered frame by frame for however much longer the fade
+        # runs than whatever was already being rendered per frame there
+        fade_frames = self.rarefaction_fade_frames()
+        if fade_frames:
+            to_rasterize += max(0, fade_frames - self.genome_turn_frames(effect_frames)[1])
+
         self.run.warning(None, header="ASSEMBLING VIDEO", lc="green")
         self.run.info("New node effect, main graph", self.main_graph_new_node_effect,
                       mc='green' if self.user_set_cosmetic('main_graph_new_node_effect') else 'yellow')
@@ -2073,8 +2581,14 @@ class PanGraphVideoGenerator:
             self.run.info("Effect frames per genome", f"{effect_frames} "
                           f"({longest:g} of --seconds-per-genome, at {self.fps} fps), starting on the "
                           f"very first frame the genome fades in on")
-        self.run.info("Frames to rasterize", pp(to_rasterize) + (" (one per genome, plus every effect frame)"
-                                                                if effect_frames else " (one per genome)"))
+        if self.rarefaction_fade_frames():
+            self.run.info("Rarefaction panel fade", f"{self.rarefaction_fade_frames()} frames "
+                          f"(--seconds-per-genome, at {self.fps} fps), over the turn of genome "
+                          f"{self.rarefaction_fade_in_at_genome}")
+        extras = ([] + (["every effect frame"] if effect_frames else [])
+                     + (["every frame of the rarefaction panel's fade"] if fade_frames else []))
+        self.run.info("Frames to rasterize", pp(to_rasterize) + " (one per genome"
+                      + (", plus " + " and ".join(extras) if extras else "") + ")")
         self.run.info("Threads to rasterize with", f"{self.num_threads} (`--num-threads`)")
 
         hard_linked = self.count_hard_linked_frames(effect_frames)
@@ -2128,6 +2642,7 @@ class PanGraphVideoGenerator:
                 frame_counter[0] += 1
 
         dissolve_frames, arrival_frames, turn_frames = self.genome_turn_frames(effect_frames)
+        fade_frames = self.rarefaction_fade_frames()
 
         def dissolve(img_a, img_b):
             start = frame_counter[0]
@@ -2139,10 +2654,16 @@ class PanGraphVideoGenerator:
             frame_counter[0] = start + dissolve_frames
 
         def play_genome(i):
-            """One genome's turn: it fades in with its effect ALREADY running over it, the
-            effect finishes over the settled graph, and whatever is left of the turn is held
-            still. Only the overlay is recomputed per frame, so nothing underneath is built
-            twice.
+            """One genome's turn, rendered a frame at a time for as long as anything in it is
+            still moving: it fades in with its effect ALREADY running over it, the effect
+            finishes over the settled graph, and whatever is left of the turn is held still.
+
+            Two things can be moving, and either one puts the turn down this path. The arrival
+            EFFECT moves over the top of the frame, and only the overlay is recomputed for it, so
+            nothing underneath gets built twice. The rarefaction panel's FADE
+            (`--rarefaction-fade-in-at-genome`) is part of the frame itself rather than an overlay
+            on it, so on that one genome the scene underneath is rebuilt per frame too -- a cost
+            paid on exactly one turn of the whole video.
 
             Every frame of the turn is independent of every other one, which is what lets them be
             rasterized side by side (see `run_in_parallel`). Each worker saves its own frame
@@ -2150,25 +2671,35 @@ class PanGraphVideoGenerator:
             nothing has to be handed back in order, and no more than --num-threads frames are
             ever in memory at once."""
 
+            panel_fade = fade_frames if self.frames[i]['n'] == self.rarefaction_fade_in_at_genome else 0
+            per_frame = max(arrival_frames, panel_fade)
+
             # the arriving genome's own nodes are in the air for the whole of this, so the base
             # underneath them is this frame's scene WITHOUT them. Everything else about it is
-            # identical to `scenes[i]`, which is what the rest of the turn is held on.
-            base = self.build_scene(i, arrivals_in_flight=True) if self.main_graph_nodes_fly_in else scenes[i]
+            # identical to `scenes[i]`, which is what the rest of the turn is held on. A fading
+            # panel is the one case where that base is not the same in every frame.
+            base = None if panel_fade else (self.build_scene(i, arrivals_in_flight=True)
+                                            if self.main_graph_nodes_fly_in else scenes[i])
 
             start = frame_counter[0]
 
             def render_and_write(step):
-                overlay = self.arrival_overlay_shapes(i, min(1.0, step / effect_frames))
-                image = self.rasterize_scene({'shapes': base['shapes'] + overlay,
-                                             'texts': base['texts']})
+                scene = base
+                if scene is None:
+                    scene = self.build_scene(i, arrivals_in_flight=self.main_graph_nodes_fly_in,
+                                             panel_opacity=min(1.0, (step + 1) / panel_fade))
+
+                overlay = self.arrival_overlay_shapes(i, min(1.0, step / effect_frames)) if effect_frames else []
+                image = self.rasterize_scene({'shapes': scene['shapes'] + overlay,
+                                             'texts': scene['texts']})
                 if step < dissolve_frames:
                     image = Image.blend(images[i - 1], image, (step + 1) / (dissolve_frames + 1))
                 image.save(frame_path(start + step))
 
-            self.run_in_parallel(render_and_write, range(arrival_frames))
-            frame_counter[0] = start + arrival_frames
+            self.run_in_parallel(render_and_write, range(per_frame))
+            frame_counter[0] = start + per_frame
 
-            write_image(images[i], repeats=max(1, turn_frames - arrival_frames))
+            write_image(images[i], repeats=max(1, turn_frames - per_frame))
 
         def note(i):
             of = f"genome {self.frames[i]['n']}/{self.total_genomes_rendered}"
@@ -2180,11 +2711,12 @@ class PanGraphVideoGenerator:
 
         for i in range(1, len(images)):
             note(i)
-            if effect_frames:
+            if effect_frames or (fade_frames and self.frames[i]['n'] == self.rarefaction_fade_in_at_genome):
                 play_genome(i)
             else:
-                # nothing to lay over the graph, so the fade is a plain blend of two ready
-                # images and the whole of the rest of the turn is one of them repeated
+                # nothing to lay over the graph and nothing fading into it, so the transition is
+                # a plain blend of two ready images and the whole of the rest of the turn is one
+                # of them repeated
                 dissolve(images[i - 1], images[i])
                 write_image(images[i], repeats=max(1, turn_frames - dissolve_frames))
 
@@ -2270,7 +2802,11 @@ def get_args():
                         "render can take a while, this is a convenient way to see what your output will look "
                         "like with a handful of genomes first.")
 
-    groupB = parser.add_argument_group('INSET', "An optional second, magnified panel following one locus.")
+    groupB = parser.add_argument_group('INSET PANEL', "What goes into the panel in the left-hand column, if "
+                        "anything. Two things can claim it -- a magnified view of one locus (`--inset-flanks`) "
+                        "or rarefaction curves for the whole graph (`--show-rarefaction`) -- and they are "
+                        "mutually exclusive, since there is only the one panel. Ask for neither and the column "
+                        "simply carries the title block and the genome counter, with nothing below them.")
     groupB.add_argument('--inset-flanks', default=None, metavar='LEFT_NODE,RIGHT_NODE', help="Two node ids "
                         "(as they appear in the pan-graph-db) flanking the locus to magnify in an inset "
                         "panel. Both must be present in every frame you render (i.e. conserved/backbone "
@@ -2289,6 +2825,21 @@ def get_args():
                         "nodes sit at the panel's edges from the very first frame and what grows between them "
                         "is the structure alone. The levels keep their pinned height either way, so the "
                         "subgraph still gains height as it gains genomes.")
+
+    groupB.add_argument('--show-rarefaction', default=False, action='store_true', help="Draw rarefaction "
+                        "curves for the pangenome in the panel, revealed one genome at a time in step with the "
+                        "genome counter. Two curves are drawn, each with a band of plus/minus one standard "
+                        "deviation around it: the whole pangenome, and the core (the SynGCs present in every "
+                        "one of the subsampled genomes). The curves cover EVERY SynGC in the pan-graph-db "
+                        "rather than only those of the `--component` being drawn, and they are computed over "
+                        "exactly the genomes this video renders, in the order they arrive, so the panel's x "
+                        "axis is the same axis the genome counter is counting along. Cannot be combined with "
+                        "--inset-flanks, which wants the same panel.")
+    groupB.add_argument('--rarefaction-iterations', default=100, type=int, help="How many random subsamples to "
+                        "draw at each genome count when computing the rarefaction curves (default: "
+                        "%(default)d). This is the same parameter `anvi-compute-rarefaction-curves` calls "
+                        "`--iterations`, and the same advice applies: above 100 rarely refines anything, and "
+                        "below 10 leaves the curves visibly lumpy. Only relevant with --show-rarefaction.")
 
     groupD = parser.add_argument_group('GEOMETRY', "How the graph is drawn. Defaults are reasonable for most "
                                        "pangenomes; adjust if your graph looks too cramped or too sparse.")
@@ -2449,6 +3000,29 @@ def get_args():
     groupCosmetics.add_argument('--genome-track-line-background', default=None, help="Genome-track background "
                                 "band color as a hex code. By default the background color stored in the "
                                 "pan-graph-db's own state is used (usually a near-white gray).")
+
+    groupCosmetics.add_argument('--rarefaction-all-syngcs-color', default=None, help=f"Color of the "
+                                f"all-SynGCs rarefaction curve, and of its standard-deviation band, as a hex "
+                                f"code (default: {RAREFACTION_ALL_SYNGCS_COLOR}). Only relevant with "
+                                f"--show-rarefaction.")
+    groupCosmetics.add_argument('--rarefaction-core-syngcs-color', default=None, help=f"Color of the "
+                                f"core-SynGCs rarefaction curve, and of its standard-deviation band, as a hex "
+                                f"code (default: {RAREFACTION_CORE_SYNGCS_COLOR}). Only relevant with "
+                                f"--show-rarefaction.")
+    groupCosmetics.add_argument('--rarefaction-line-width', default=None, type=float, help="Width of the two "
+                                "rarefaction curves in pixels. By default it is derived from the output "
+                                "resolution. Only relevant with --show-rarefaction.")
+    groupCosmetics.add_argument('--rarefaction-fade-in-at-genome', default=None, type=int, metavar='N',
+                                help="Keep the rarefaction panel (and the line of text above it) off screen "
+                                "until genome N arrives, then fade it in with that genome. Watching a curve "
+                                "draw itself from the very first genome can be a slow start, and this hands "
+                                "you the timing: pass 11 and the first ten genomes are just the graph growing, "
+                                "with the panel arriving alongside the eleventh, already part-drawn. N is the "
+                                "genome the panel comes in WITH, so it is the number the genome counter is "
+                                "showing at that moment. The fade itself lasts --seconds-per-genome: it starts "
+                                "as that genome does and is complete by the end of its turn on screen, so it is "
+                                "slow enough to watch. Nothing else in the column moves when it appears. By default the panel is there from the first genome onward. Only "
+                                "relevant with --show-rarefaction.")
 
     groupE = parser.add_argument_group('TIMING', "Pacing of the animation.")
     groupE.add_argument('--fps', default=30, type=int, help="Frames per second (default: 30).")
