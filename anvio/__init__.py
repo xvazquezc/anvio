@@ -192,6 +192,13 @@ D = {
              'required': True,
              'help': "Anvi'o pan database"}
                 ),
+    'pan-or-pan-graph-db': (
+            ['-p', '--pan-or-pan-graph-db'],
+            {'metavar': "PAN_OR_PAN_GRAPH_DB",
+             'required': True,
+             'help': "An anvi'o pan-db or pan-graph-db. Which one it is is worked out from the database "
+                     "itself, so either may be given here."}
+                ),
     'pan-or-profile-db': (
             ['-p', '--pan-or-profile-db'],
             {'metavar': "PAN_OR_PROFILE_DB",
