@@ -107,23 +107,84 @@ progress = terminal.Progress()
 pp = terminal.pretty_print
 P = terminal.pluralize
 
-# what an SVG names as its font-family when the chosen typeface is not on this machine, and
-# there is therefore no one family that can honestly be named
-FALLBACK_FONT_FAMILY = 'Helvetica, Arial, sans-serif'
+# every role this program asks for by name. A typeface has to cover all of them to be usable,
+# since `get_font` resolves ONE typeface up front and then never falls back again mid-render
+FONT_ROLES = ('regular', 'medium', 'demi', 'bold', 'italic')
 
-# face index -> (font file, {role: face index}, SVG font-family). Every text position
-# and text size in this program is authored against a 2160-tall frame, and scaled to the
-# actual canvas height by `px()`.
+
+def font_collection(path, faces):
+    """A `{role: (file, face index)}` map for one .ttc COLLECTION: many faces in a single file.
+
+    How macOS ships its system typefaces, and why a face index is needed at all."""
+
+    return {role: (path, faces[role]) for role in FONT_ROLES}
+
+
+def font_family_candidates(family, directories, files):
+    """One candidate per directory, for a family shipped as ONE FILE PER FACE.
+
+    How Linux distributions ship theirs, and they disagree about where fonts live far more than
+    they disagree about what the files are called -- hence the same `files` against every
+    plausible directory. Each directory becomes its own candidate rather than being narrowed down
+    here, so that `resolve_font_set` settles it the only way that really answers the question:
+    by trying to load the faces. Face index is 0 throughout, since these files hold one face
+    each."""
+
+    return [(family, {role: (os.path.join(directory, files[role]), 0) for role in FONT_ROLES})
+            for directory in directories]
+
+
+def bundled_font_dir():
+    """matplotlib's bundled font directory, or None.
+
+    Worth knowing about because anvi'o depends on matplotlib, which ships the DejaVu family
+    inside its own package -- so there is a copy of these exact files in every anvi'o
+    environment, even a bare container with no system fonts installed at all. Located through
+    `importlib` rather than by importing matplotlib, which is far too expensive to pay for at
+    import time for a path."""
+
+    try:
+        spec = importlib.util.find_spec('matplotlib')
+    except Exception:
+        return None
+
+    if not spec or not spec.submodule_search_locations:
+        return None
+
+    return os.path.join(list(spec.submodule_search_locations)[0], 'mpl-data', 'fonts', 'ttf')
+
+
+# DejaVu Sans is present on essentially every Linux box, good fall back outside macOS.
+# It ships Book and Bold only (no medium and no true demi (sad face)), so those two roles
+# borrow the nearest weight it does have.
+DEJAVU_SANS_DIRS = ['/usr/share/fonts/dejavu',                 # Fedora / RHEL / CentOS / SUSE
+                    '/usr/share/fonts/truetype/dejavu',        # Debian / Ubuntu
+                    '/usr/share/fonts/dejavu-sans-fonts',      # some RHEL rebuilds
+                    '/usr/share/fonts/TTF',                    # Arch
+                    '/usr/local/share/fonts/dejavu',           # hand-installed
+                    bundled_font_dir()]                        # matplotlib's own copy
+DEJAVU_SANS_FILES = {'regular': 'DejaVuSans.ttf', 'medium': 'DejaVuSans.ttf',
+                     'demi': 'DejaVuSans-Bold.ttf', 'bold': 'DejaVuSans-Bold.ttf',
+                     'italic': 'DejaVuSans-Oblique.ttf'}
+DEJAVU_SANS = font_family_candidates('DejaVu Sans', [d for d in DEJAVU_SANS_DIRS if d],
+                                     DEJAVU_SANS_FILES)
+
 FONT_SETS = {
-    'helvetica': ('/System/Library/Fonts/HelveticaNeue.ttc',
-                  {'bold': 1, 'demi': 10, 'medium': 10, 'italic': 2, 'regular': 0},
-                  'Helvetica Neue'),
-    'avenir': ('/System/Library/Fonts/Avenir Next.ttc',
-               {'bold': 0, 'demi': 2, 'medium': 5, 'italic': 4, 'regular': 7},
-               'Avenir Next'),
+    'helvetica': [('Helvetica Neue',
+                   font_collection('/System/Library/Fonts/HelveticaNeue.ttc',
+                                   {'bold': 1, 'demi': 10, 'medium': 10, 'italic': 2, 'regular': 0}))]
+                 + DEJAVU_SANS,
+    'avenir': [('Avenir Next',
+                font_collection('/System/Library/Fonts/Avenir Next.ttc',
+                                {'bold': 0, 'demi': 2, 'medium': 5, 'italic': 4, 'regular': 7}))]
+            + DEJAVU_SANS,
 }
 BOLD_ROLES = {'bold'}
 ITALIC_ROLES = {'italic'}
+
+# what an SVG names as its font-family when not one candidate typeface loaded and the text was
+# therefore measured with Pillow's own built-in face, which has no name worth writing down
+FALLBACK_FONT_FAMILY = 'Helvetica, Arial, sans-serif'
 
 INK, MUTED, FAINT = (17, 17, 17), (140, 140, 140), (228, 228, 228)
 BLUE = (31, 111, 235)
@@ -288,6 +349,12 @@ class PanGraphVideoGenerator:
 
         # thread-local rather than one shared dict, see `get_font`
         self._fonts = threading.local()
+
+        # one typeface for the whole render, settled before a single string is measured, since
+        # every position in the output is derived from its metrics. See `resolve_font_set`
+        self.font_family = None
+        self.font_faces = None
+        self.resolve_font_set()
 
 
     def check_dependencies(self):
@@ -958,8 +1025,79 @@ class PanGraphVideoGenerator:
         return (ox + px_, oy + py_)
 
 
+    def resolve_font_set(self):
+        """Settle on ONE typeface for the whole render before any text is measured."""
+
+        from PIL import ImageFont
+
+        for family, faces in FONT_SETS[self.font_choice]:
+            try:
+                # actually LOAD every role, rather than trusting that the files are on disk: a
+                # font that is present but unreadable has to lose here, where there is still a
+                # candidate left to try, and not mid-render where there is not
+                for role in FONT_ROLES:
+                    font_path, index = faces[role]
+                    ImageFont.truetype(font_path, 12, index=index)
+            except Exception:
+                continue
+
+            self.font_family, self.font_faces = family, faces
+
+            return
+
+        # nothing loaded. Pillow's built-in face is all that is left, and it is only usable at
+        # all if this Pillow can scale it (10.1.0 and newer); older ones hand back the fixed
+        # ~10px face that caused the mess described above, so say so rather than quietly ship it
+        self.font_family, self.font_faces = FALLBACK_FONT_FAMILY, None
+
+        scalable = self.fallback_font_is_scalable()
+        searched = sorted({os.path.dirname(faces[role][0])
+                           for _family, faces in FONT_SETS[self.font_choice] for role in FONT_ROLES})
+
+        self.run.warning(f"None of the typefaces anvi'o knows about for `--font {self.font_choice}` could be "
+                         f"loaded on this machine, so all text will be set in Pillow's own built-in face "
+                         f"instead"
+                         + (". Text will be legible, but it will not look like it does elsewhere."
+                            if scalable else
+                            f", and this Pillow ({self.pillow_version() or 'unknown version'}) is too old to "
+                            f"scale that face -- every line of text will come out roughly 10 pixels tall and "
+                            f"badly placed. Upgrade Pillow to 10.1.0 or newer, or install one of the fonts "
+                            f"below.")
+                         + f" Directories searched: {', '.join(searched)}. On Linux, installing DejaVu Sans "
+                         f"(`dejavu-sans-fonts` on Fedora/RHEL, `fonts-dejavu-core` on Debian/Ubuntu) is the "
+                         f"cheapest fix.",
+                         header="NO USABLE FONT FOUND", lc='yellow')
+
+
+    @staticmethod
+    def pillow_version():
+        try:
+            import PIL
+
+            return PIL.__version__
+        except Exception:
+            return None
+
+
+    @staticmethod
+    def fallback_font_is_scalable():
+        """Whether this Pillow's `load_default` takes a size (10.1.0 and newer).
+
+        Asked of the function rather than of `PIL.__version__` so that it stays true to what the
+        installed Pillow can actually do."""
+
+        from PIL import ImageFont
+
+        try:
+            ImageFont.load_default(12)
+
+            return True
+        except Exception:
+            return False
+
+
     def get_font(self, size_px, role):
-        """A face of the chosen typeface at a given size.
+        """A face of the resolved typeface (see `resolve_font_set`) at a given size.
 
         The cache behind this is THREAD-LOCAL, and deliberately so. Pillow's `FreeTypeFont` wraps
         a single FreeType face, and FreeType promises nothing about one face being drawn with from
@@ -974,23 +1112,18 @@ class PanGraphVideoGenerator:
         key = (int(round(size_px)), role)
         if key not in cache:
             from PIL import ImageFont
-            path, faces, _family = FONT_SETS[self.font_choice]
-            try:
-                cache[key] = ImageFont.truetype(path, max(1, key[0]), index=faces.get(role, faces['regular']))
-            except Exception:
-                cache[key] = self._fallback_font(key[0])
+
+            if self.font_faces is None:
+                # no typeface resolved; `resolve_font_set` has already warned about it
+                try:
+                    cache[key] = ImageFont.load_default(max(1, key[0]))
+                except TypeError:
+                    cache[key] = ImageFont.load_default()
+            else:
+                font_path, index = self.font_faces[role]
+                cache[key] = ImageFont.truetype(font_path, max(1, key[0]), index=index)
+
         return cache[key]
-
-
-    @staticmethod
-    def _fallback_font(size_px):
-        from PIL import ImageFont
-        for font_path in ["/System/Library/Fonts/Helvetica.ttc", "/System/Library/Fonts/Supplemental/Arial.ttf", "Arial.ttf"]:
-            try:
-                return ImageFont.truetype(font_path, max(1, size_px))
-            except Exception:
-                continue
-        return ImageFont.load_default()
 
 
     # ------------------------------------------------------------------
@@ -2355,12 +2488,12 @@ class PanGraphVideoGenerator:
         One family, not a fallback stack. An editor shows whatever is written here verbatim in
         its own font box, so a stack has to be deleted and retyped by hand before it will do
         anything, every single time the file is opened. Naming a single family is only honest if
-        that family is actually on the machine, which is what the presence of its file settles,
-        so the stack is kept in reserve for when it is not."""
+        it is the family whose metrics produced the coordinates in the same file, which is why
+        this is whatever `resolve_font_set` settled on rather than a second, independent guess.
+        The stack is kept in reserve for the one case with no honest answer: no typeface loaded
+        at all, and the text was measured with Pillow's own nameless built-in face."""
 
-        path, _faces, family = FONT_SETS[self.font_choice]
-
-        return family if os.path.exists(path) else FALLBACK_FONT_FAMILY
+        return self.font_family
 
 
     def scene_to_svg(self, scene):
@@ -3051,7 +3184,11 @@ def get_args():
                         "LEFT_NODE and RIGHT_NODE detailed\", with the actual two --inset-flanks node ids "
                         "filled in. Wraps to fit the text column's width. Pass an empty string to hide it.")
     groupF.add_argument('--font', default='helvetica', choices=list(FONT_SETS.keys()), help="Typeface for "
-                        "all on-screen text (default: helvetica).")
+                        "all on-screen text (default: helvetica). These are macOS system typefaces. On "
+                        "Linux system anvi'o will set everything in DejaVu Sans instead. DejaVu runs wider "
+                        "so a Linux render will not be pixel-identical to a macOS one. We mostly tested "
+                        "this program on macOS, so if you are running into ugly displays on Linux please "
+                        "let us know and we will work on it.")
 
     groupPerf = parser.add_argument_group('PERFORMANCE', "How hard anvi'o works at getting this done.")
     groupPerf.add_argument(*anvio.A('num-threads'), **anvio.K('num-threads', {'help': "How many frames to "
